@@ -6,23 +6,19 @@ export const config = {
 
 export default async function handler(request) {
   try {
-    // 1. Config ယူခြင်း
     const envData = process.env.ACCOUNTS_JSON;
     if (!envData) return new Response("Config Error", { status: 500 });
     const R2_ACCOUNTS = JSON.parse(envData);
 
-    // 2. URL Params
     const url = new URL(request.url);
     const video = url.searchParams.get('video');
     const acc = url.searchParams.get('acc');
 
-    // 🔥 FIX: Cron-job အတွက် Ping စစ်ဆေးခြင်း
-    // video=ping လို့လာရင် R2 ဆီမသွားဘဲ ချက်ချင်း 200 OK ပြန်မယ်
+    // Ping check for Cron-job
     if (video === "ping") {
       return new Response("Pong! Vercel is awake 🤖", { status: 200 });
     }
 
-    // Validation
     if (!video || !acc || !R2_ACCOUNTS[acc]) {
       return new Response("Invalid Parameters", { status: 400 });
     }
@@ -36,24 +32,30 @@ export default async function handler(request) {
     });
 
     const endpoint = `https://${creds.accountId}.r2.cloudflarestorage.com`;
-    // URL Encode space fix
     const encodedVideo = encodeURIComponent(video).replace(/%2F/g, "/");
     const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedVideo}`);
-    const headers = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
+    const hostHeader = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
 
-    // 🔥 HEAD Request Handling (APK Size Check)
+    // 🔥 FIX: APK အတွက် Size Check (HEAD Request)
     if (request.method === "HEAD") {
       const signedHead = await r2.sign(objectUrl, {
         method: "HEAD",
         aws: { signQuery: true },
-        headers: headers,
+        headers: hostHeader,
         expiresIn: 3600
       });
 
+      // R2 ဆီက Header တွေ လှမ်းယူမယ်
       const r2Response = await fetch(signedHead.url, { method: "HEAD" });
       
+      // Header အသစ်ပြန်စီမယ်
       const newHeaders = new Headers(r2Response.headers);
+      
+      // CORS: APK က Header တွေကို ဖတ်ခွင့်ရအောင် ဖွင့်ပေးခြင်း
       newHeaders.set("Access-Control-Allow-Origin", "*");
+      newHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+      // 👇 ဒီလိုင်းက အရေးအကြီးဆုံးပါ (Size နဲ့ Name ကို ဖော်ပြခိုင်းတာပါ)
+      newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, Content-Type, ETag");
 
       return new Response(null, {
         status: 200,
@@ -65,7 +67,7 @@ export default async function handler(request) {
     const signedGet = await r2.sign(objectUrl, {
       method: 'GET',
       aws: { signQuery: true },
-      headers: headers,
+      headers: hostHeader,
       expiresIn: 3600
     });
 
