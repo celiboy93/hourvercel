@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "aws4fetch": "^1.4.4"
+  }
+}
