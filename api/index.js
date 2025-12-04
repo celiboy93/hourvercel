@@ -6,17 +6,24 @@ export const config = {
 
 export default async function handler(request) {
   try {
+    // 1. Config ယူခြင်း
     const envData = process.env.ACCOUNTS_JSON;
     if (!envData) return new Response("Config Error", { status: 500 });
     const R2_ACCOUNTS = JSON.parse(envData);
 
+    // 2. URL Params
     const url = new URL(request.url);
     const video = url.searchParams.get('video');
-    const acc = url.searchParams.get('acc') || "1";
+    const acc = url.searchParams.get('acc');
 
-    if (video === "ping") return new Response("Pong!", { status: 200 });
+    // 🔥 FIX: Cron-job အတွက် Ping စစ်ဆေးခြင်း
+    // video=ping လို့လာရင် R2 ဆီမသွားဘဲ ချက်ချင်း 200 OK ပြန်မယ်
+    if (video === "ping") {
+      return new Response("Pong! Vercel is awake 🤖", { status: 200 });
+    }
 
-    if (!video || !R2_ACCOUNTS[acc]) {
+    // Validation
+    if (!video || !acc || !R2_ACCOUNTS[acc]) {
       return new Response("Invalid Parameters", { status: 400 });
     }
 
@@ -29,74 +36,40 @@ export default async function handler(request) {
     });
 
     const endpoint = `https://${creds.accountId}.r2.cloudflarestorage.com`;
-    // Filename Logic (Node.js Code အတိုင်း)
-    const objectKey = decodeURIComponent(video);
-    const cleanFileName = objectKey.split('/').pop();
-    const encodedFileName = encodeURIComponent(cleanFileName);
-    
-    // R2 Path Encode
-    const encodedPath = encodeURIComponent(video).replace(/%2F/g, "/");
-    const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedPath}`);
-    const hostHeader = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
+    // URL Encode space fix
+    const encodedVideo = encodeURIComponent(video).replace(/%2F/g, "/");
+    const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedVideo}`);
+    const headers = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
 
-    // Content-Disposition String
-    const contentDisposition = `attachment; filename="${cleanFileName}"; filename*=UTF-8''${encodedFileName}`;
+    // 🔥 HEAD Request Handling (APK Size Check)
+    if (request.method === "HEAD") {
+      const signedHead = await r2.sign(objectUrl, {
+        method: "HEAD",
+        aws: { signQuery: true },
+        headers: headers,
+        expiresIn: 3600
+      });
 
-    // ⬇️ Signed URL for GET (Download)
-    // 4 Hours Expiry (Node.js Code အတိုင်း)
+      const r2Response = await fetch(signedHead.url, { method: "HEAD" });
+      
+      const newHeaders = new Headers(r2Response.headers);
+      newHeaders.set("Access-Control-Allow-Origin", "*");
+
+      return new Response(null, {
+        status: 200,
+        headers: newHeaders
+      });
+    }
+
+    // Normal Redirect (GET)
     const signedGet = await r2.sign(objectUrl, {
       method: 'GET',
       aws: { signQuery: true },
-      headers: hostHeader,
-      expiresIn: 14400 
+      headers: headers,
+      expiresIn: 3600
     });
-    
-    // Add content-disposition to the signed URL query for R2 to force it
-    signedGet.url.searchParams.set("response-content-disposition", contentDisposition);
 
-    // 🔥 HEAD Request Logic (Improved with Fallback)
-    if (request.method === "HEAD") {
-      try {
-        const signedHead = await r2.sign(objectUrl, {
-          method: "HEAD",
-          aws: { signQuery: true },
-          headers: hostHeader,
-          expiresIn: 3600
-        });
-
-        const r2Response = await fetch(signedHead.url, { method: "HEAD" });
-
-        // အကယ်၍ R2 က 200 OK ပြန်မှသာ Size ကို ပို့မယ်
-        if (r2Response.ok) {
-          const newHeaders = new Headers();
-          newHeaders.set("Access-Control-Allow-Origin", "*");
-          newHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-          newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Content-Disposition, Accept-Ranges, ETag");
-          
-          if (r2Response.headers.has("Content-Length")) {
-            newHeaders.set("Content-Length", r2Response.headers.get("Content-Length"));
-          }
-          newHeaders.set("Content-Type", r2Response.headers.get("Content-Type") || "video/mp4");
-          newHeaders.set("Content-Disposition", contentDisposition);
-          newHeaders.set("Accept-Ranges", "bytes");
-
-          return new Response(null, {
-            status: 200,
-            headers: newHeaders
-          });
-        }
-        // R2 က Error တက်ရင် အောက်က Redirect (Fallback) ကို ဆက်သွားမယ်...
-      } catch (e) {
-        // Fallback to Redirect
-      }
-      
-      // Fallback: HEAD request မအောင်မြင်ရင် 302 Redirect လုပ်လိုက်မယ်
-      // APK က Redirect URL ဆီကနေ Size ကို သူ့ဘာသာ ဆက်ရှာလိမ့်မယ်
-      return Response.redirect(signedGet.url, 302);
-    }
-
-    // ⬇️ GET Request (Direct Redirect)
-    return Response.redirect(signedGet.url, 302);
+    return Response.redirect(signedGet.url, 307);
 
   } catch (error) {
     return new Response(`Error: ${error.message}`, { status: 500 });
