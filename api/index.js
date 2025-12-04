@@ -6,15 +6,26 @@ export const config = {
 
 export default async function handler(request) {
   try {
+    // 1. Config ယူခြင်း
     const envData = process.env.ACCOUNTS_JSON;
     if (!envData) return new Response("Config Error", { status: 500 });
     const R2_ACCOUNTS = JSON.parse(envData);
 
+    // 2. URL Params
     const url = new URL(request.url);
     const video = url.searchParams.get('video');
     const acc = url.searchParams.get('acc');
 
-    if (!video || !acc || !R2_ACCOUNTS[acc]) return new Response("Invalid Params", { status: 400 });
+    // 🔥 FIX: Cron-job အတွက် Ping စစ်ဆေးခြင်း
+    // video=ping လို့လာရင် R2 ဆီမသွားဘဲ ချက်ချင်း 200 OK ပြန်မယ်
+    if (video === "ping") {
+      return new Response("Pong! Vercel is awake 🤖", { status: 200 });
+    }
+
+    // Validation
+    if (!video || !acc || !R2_ACCOUNTS[acc]) {
+      return new Response("Invalid Parameters", { status: 400 });
+    }
 
     const creds = R2_ACCOUNTS[acc];
     const r2 = new AwsClient({
@@ -30,7 +41,7 @@ export default async function handler(request) {
     const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedVideo}`);
     const headers = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
 
-    // 🔥 HEAD Request Handling (Size Check)
+    // 🔥 HEAD Request Handling (APK Size Check)
     if (request.method === "HEAD") {
       const signedHead = await r2.sign(objectUrl, {
         method: "HEAD",
@@ -50,7 +61,7 @@ export default async function handler(request) {
       });
     }
 
-    // Normal Redirect
+    // Normal Redirect (GET)
     const signedGet = await r2.sign(objectUrl, {
       method: 'GET',
       aws: { signQuery: true },
