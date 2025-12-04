@@ -14,10 +14,7 @@ export default async function handler(request) {
     const video = url.searchParams.get('video');
     const acc = url.searchParams.get('acc');
 
-    // Ping check for Cron-job
-    if (video === "ping") {
-      return new Response("Pong! Vercel is awake 🤖", { status: 200 });
-    }
+    if (video === "ping") return new Response("Pong!", { status: 200 });
 
     if (!video || !acc || !R2_ACCOUNTS[acc]) {
       return new Response("Invalid Parameters", { status: 400 });
@@ -32,6 +29,7 @@ export default async function handler(request) {
     });
 
     const endpoint = `https://${creds.accountId}.r2.cloudflarestorage.com`;
+    // Filename တွေကို URL Encode လုပ်ရာမှာ - နဲ့ _ က ပြဿနာမရှိပါ
     const encodedVideo = encodeURIComponent(video).replace(/%2F/g, "/");
     const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedVideo}`);
     const hostHeader = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
@@ -49,12 +47,24 @@ export default async function handler(request) {
       const r2Response = await fetch(signedHead.url, { method: "HEAD" });
       
       // Header အသစ်ပြန်စီမယ်
-      const newHeaders = new Headers(r2Response.headers);
+      const newHeaders = new Headers();
       
-      // CORS: APK က Header တွေကို ဖတ်ခွင့်ရအောင် ဖွင့်ပေးခြင်း
+      // R2 ကပြန်ပေးတဲ့ အရေးကြီး Header တွေကို ကူးထည့်မယ်
+      const size = r2Response.headers.get("Content-Length");
+      const type = r2Response.headers.get("Content-Type");
+      const disposition = r2Response.headers.get("Content-Disposition");
+      const etag = r2Response.headers.get("ETag");
+
+      if (size) newHeaders.set("Content-Length", size);
+      if (type) newHeaders.set("Content-Type", type);
+      if (disposition) newHeaders.set("Content-Disposition", disposition);
+      if (etag) newHeaders.set("ETag", etag);
+
+      // CORS Permission (APK ဖတ်လို့ရအောင်)
       newHeaders.set("Access-Control-Allow-Origin", "*");
       newHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-      // 👇 ဒီလိုင်းက အရေးအကြီးဆုံးပါ (Size နဲ့ Name ကို ဖော်ပြခိုင်းတာပါ)
+      
+      // 👇 ဒီစာကြောင်းကြောင့် APK က Size ကို မြင်ရမှာပါ
       newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, Content-Type, ETag");
 
       return new Response(null, {
