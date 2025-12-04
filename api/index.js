@@ -1,23 +1,25 @@
 import { AwsClient } from 'aws4fetch';
 
-export const config = {
-  runtime: 'edge',
-};
-
-export default async function handler(request) {
+// Node.js Runtime ကို အသုံးပြုပါမည် (Header ပိုစိတ်ချရသည်)
+export default async function handler(req, res) {
   try {
     const envData = process.env.ACCOUNTS_JSON;
-    if (!envData) return new Response("Config Error", { status: 500 });
+    if (!envData) return res.status(500).send("Config Error");
+    
     const R2_ACCOUNTS = JSON.parse(envData);
+    
+    // URL Parsing (Node.js style)
+    const protocol = req.headers['x-forwarded-proto'] || 'https';
+    const host = req.headers.host;
+    const fullUrl = new URL(req.url, `${protocol}://${host}`);
+    
+    const video = fullUrl.searchParams.get('video');
+    const acc = fullUrl.searchParams.get('acc') || "1";
 
-    const url = new URL(request.url);
-    const video = url.searchParams.get('video');
-    const acc = url.searchParams.get('acc') || "1";
-
-    if (video === "ping") return new Response("Pong!", { status: 200 });
+    if (video === "ping") return res.status(200).send("Pong!");
 
     if (!video || !R2_ACCOUNTS[acc]) {
-      return new Response("Invalid Parameters", { status: 400 });
+      return res.status(400).send("Invalid Parameters");
     }
 
     const creds = R2_ACCOUNTS[acc];
@@ -28,55 +30,53 @@ export default async function handler(request) {
       region: 'auto',
     });
 
-    // Deno Logic အတိုင်း URL တည်ဆောက်ပုံကို ရိုးရှင်းလိုက်ပါမယ်
-    // (အပို Encode တွေ ဖြုတ်လိုက်ပါပြီ)
     const endpoint = `https://${creds.accountId}.r2.cloudflarestorage.com`;
-    const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${video}`);
-    const hostHeader = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
-
-    // 🔥 HEAD Request (Proxy All Headers)
-    // Deno မှာ အလုပ်ဖြစ်တဲ့ နည်းလမ်းအတိုင်း Header အကုန်ကူးထည့်ပါမယ်
-    if (request.method === "HEAD") {
-      const signedHead = await r2.sign(objectUrl, {
-        method: "HEAD",
-        aws: { signQuery: true },
-        headers: hostHeader,
-        expiresIn: 3600
-      });
-
-      const r2Response = await fetch(signedHead.url, { method: "HEAD" });
-      
-      // R2 က ပြန်လာတဲ့ Header အကုန်လုံးကို အသစ်ထဲ ထည့်မယ်
-      const newHeaders = new Headers(r2Response.headers);
-      
-      // CORS နဲ့ Expose Headers ကို ထပ်ဖြည့်မယ် (ဒါက အရေးကြီးပါတယ်)
-      newHeaders.set("Access-Control-Allow-Origin", "*");
-      newHeaders.set("Access-Control-Expose-Headers", "*"); // Header အကုန်ပြမယ်လို့ ပြောလိုက်တာပါ
-
-      return new Response(null, {
-        status: r2Response.status, // R2 status အတိုင်းပြန်မယ် (usually 200)
-        headers: newHeaders
-      });
-    }
-
-    // ⬇️ GET Request (Download Redirect)
-    // Filename Force Download
+    
+    // Filename Logic
     const objectKey = decodeURIComponent(video);
     const cleanFileName = objectKey.split('/').pop();
-    const contentDisposition = `attachment; filename="${cleanFileName}"`;
-    
-    objectUrl.searchParams.set("response-content-disposition", contentDisposition);
+    const encodedFileName = encodeURIComponent(cleanFileName);
+    const contentDisposition = `attachment; filename="${cleanFileName}"; filename*=UTF-8''${encodedFileName}`;
 
-    const signedGet = await r2.sign(objectUrl, {
-      method: 'GET',
+    const encodedPath = encodeURIComponent(video).replace(/%2F/g, "/");
+    const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedPath}`);
+    
+    // R2 URL Params
+    objectUrl.searchParams.set("response-content-disposition", contentDisposition);
+    
+    // Sign URL
+    const signed = await r2.sign(objectUrl, {
+      method: req.method, // GET or HEAD
       aws: { signQuery: true },
-      headers: hostHeader,
-      expiresIn: 14400 
+      headers: { "Host": `${creds.accountId}.r2.cloudflarestorage.com` },
+      expiresIn: 14400 // 4 Hours
     });
 
-    return Response.redirect(signedGet.url, 302);
+    // 🔥 HEAD Request Handling (Node.js Proxy Mode)
+    if (req.method === "HEAD") {
+      // R2 ကို Size လှမ်းမေးမယ်
+      const r2Response = await fetch(signed.url, { method: "HEAD" });
+      
+      // Header တွေကို ကူးထည့်မယ်
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+      res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Type, Content-Disposition, Accept-Ranges, ETag");
+
+      if (r2Response.headers.has("content-length")) {
+        res.setHeader("Content-Length", r2Response.headers.get("content-length"));
+      }
+      res.setHeader("Content-Type", r2Response.headers.get("content-type") || "video/mp4");
+      res.setHeader("Content-Disposition", contentDisposition);
+      res.setHeader("Accept-Ranges", "bytes");
+      
+      // 200 OK နဲ့ အဆုံးသတ်မယ်
+      return res.status(200).end();
+    }
+
+    // ⬇️ GET Request (Redirect)
+    return res.redirect(302, signed.url);
 
   } catch (error) {
-    return new Response(`Error: ${error.message}`, { status: 500 });
+    return res.status(500).json({ error: error.message });
   }
 }
