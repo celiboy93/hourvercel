@@ -1,22 +1,25 @@
 import { AwsClient } from 'aws4fetch';
 
 export const config = {
-  runtime: 'edge',
+  runtime: 'edge', // အမြန်ဆုံး Edge Runtime သုံးမည်
 };
 
 export default async function handler(request) {
   try {
+    // 1. Config ယူခြင်း (JSON စနစ်)
     const envData = process.env.ACCOUNTS_JSON;
     if (!envData) return new Response("Config Error", { status: 500 });
     const R2_ACCOUNTS = JSON.parse(envData);
 
+    // 2. URL Params
     const url = new URL(request.url);
     const video = url.searchParams.get('video');
-    const acc = url.searchParams.get('acc');
+    const acc = url.searchParams.get('acc') || "1"; // Default acc=1
 
+    // Ping check for Cron-job
     if (video === "ping") return new Response("Pong!", { status: 200 });
 
-    if (!video || !acc || !R2_ACCOUNTS[acc]) {
+    if (!video || !R2_ACCOUNTS[acc]) {
       return new Response("Invalid Parameters", { status: 400 });
     }
 
@@ -29,13 +32,22 @@ export default async function handler(request) {
     });
 
     const endpoint = `https://${creds.accountId}.r2.cloudflarestorage.com`;
-    // Filename တွေကို URL Encode လုပ်ရာမှာ - နဲ့ _ က ပြဿနာမရှိပါ
-    const encodedVideo = encodeURIComponent(video).replace(/%2F/g, "/");
-    const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedVideo}`);
+    // Filename Cleaning logic from your Node.js code
+    const objectKey = decodeURIComponent(video);
+    const cleanFileName = objectKey.split('/').pop();
+    const encodedFileName = encodeURIComponent(cleanFileName);
+    
+    // URL Encode for R2 path
+    const encodedPath = encodeURIComponent(video).replace(/%2F/g, "/");
+    const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedPath}`);
     const hostHeader = { "Host": `${creds.accountId}.r2.cloudflarestorage.com` };
 
-    // 🔥 FIX: APK အတွက် Size Check (HEAD Request)
+    // Content-Disposition Format (Node.js ကုဒ်အတိုင်း ပြန်ယူထားသည်)
+    const contentDisposition = `attachment; filename="${cleanFileName}"; filename*=UTF-8''${encodedFileName}`;
+
+    // 🔥 HEAD Request Logic (APK Size Check)
     if (request.method === "HEAD") {
+      // ၁. R2 ဆီက Size သွားမေးရန် Link ထုတ်ခြင်း
       const signedHead = await r2.sign(objectUrl, {
         method: "HEAD",
         aws: { signQuery: true },
@@ -43,29 +55,24 @@ export default async function handler(request) {
         expiresIn: 3600
       });
 
-      // R2 ဆီက Header တွေ လှမ်းယူမယ်
+      // ၂. R2 ကို တကယ်လှမ်းမေးခြင်း
       const r2Response = await fetch(signedHead.url, { method: "HEAD" });
       
-      // Header အသစ်ပြန်စီမယ်
+      // ၃. Header များ ပြန်စီခြင်း
       const newHeaders = new Headers();
       
-      // R2 ကပြန်ပေးတဲ့ အရေးကြီး Header တွေကို ကူးထည့်မယ်
-      const size = r2Response.headers.get("Content-Length");
-      const type = r2Response.headers.get("Content-Type");
-      const disposition = r2Response.headers.get("Content-Disposition");
-      const etag = r2Response.headers.get("ETag");
-
-      if (size) newHeaders.set("Content-Length", size);
-      if (type) newHeaders.set("Content-Type", type);
-      if (disposition) newHeaders.set("Content-Disposition", disposition);
-      if (etag) newHeaders.set("ETag", etag);
-
-      // CORS Permission (APK ဖတ်လို့ရအောင်)
+      // CORS (အရေးကြီးသည်)
       newHeaders.set("Access-Control-Allow-Origin", "*");
       newHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
-      
-      // 👇 ဒီစာကြောင်းကြောင့် APK က Size ကို မြင်ရမှာပါ
-      newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Disposition, Content-Type, ETag");
+      newHeaders.set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Disposition, Content-Type");
+
+      // R2 မှရသော Data များကို ထည့်ခြင်း
+      if (r2Response.headers.has("Content-Length")) {
+        newHeaders.set("Content-Length", r2Response.headers.get("Content-Length"));
+      }
+      newHeaders.set("Content-Type", r2Response.headers.get("Content-Type") || "video/mp4");
+      newHeaders.set("Content-Disposition", contentDisposition);
+      newHeaders.set("Accept-Ranges", "bytes");
 
       return new Response(null, {
         status: 200,
@@ -73,15 +80,18 @@ export default async function handler(request) {
       });
     }
 
-    // Normal Redirect (GET)
+    // ⬇️ GET Request (Download Redirect)
+    // ၄. Download Link ထုတ်ပေးခြင်း (Filename ပါထည့်ပေးသည်)
+    objectUrl.searchParams.set("response-content-disposition", contentDisposition);
+    
     const signedGet = await r2.sign(objectUrl, {
       method: 'GET',
       aws: { signQuery: true },
       headers: hostHeader,
-      expiresIn: 3600
+      expiresIn: 14400 // 4 Hours (Node.js ကုဒ်အတိုင်း)
     });
 
-    return Response.redirect(signedGet.url, 307);
+    return Response.redirect(signedGet.url, 302);
 
   } catch (error) {
     return new Response(`Error: ${error.message}`, { status: 500 });
