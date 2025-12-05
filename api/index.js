@@ -1,6 +1,6 @@
 import { AwsClient } from 'aws4fetch';
 
-// runtime: 'edge' မထည့်ပါ (Node.js နဲ့ Run မှ APK Header မြင်ရလို့ပါ)
+// Node.js Runtime (Size ပေါ်အောင်)
 export default async function handler(req, res) {
   try {
     const envData = process.env.ACCOUNTS_JSON;
@@ -8,18 +8,35 @@ export default async function handler(req, res) {
     
     const R2_ACCOUNTS = JSON.parse(envData);
     
-    // URL Parsing (Node.js Style)
+    // ---------------------------------------------------------
+    // 🔍 URL Parsing Logic (Hybrid: Path & Query)
+    // ---------------------------------------------------------
+    // Query Params ယူမယ်
     const protocol = req.headers['x-forwarded-proto'] || 'https';
     const host = req.headers.host;
     const fullUrl = new URL(req.url, `${protocol}://${host}`);
     
-    const video = fullUrl.searchParams.get('video');
-    const acc = fullUrl.searchParams.get('acc') || "1";
+    let video = fullUrl.searchParams.get('video');
+    let acc = fullUrl.searchParams.get('acc');
 
+    // Query မှာ မပါရင် Path (Clean URL) ကနေ ယူမယ်
+    // URL Structure: /api/<acc>/<video_path>
+    if (!video || !acc) {
+        const pathParts = fullUrl.pathname.replace('/api/', '').split('/');
+        // အနည်းဆုံး acc နဲ့ filename ပါရမယ်
+        if (pathParts.length >= 2) {
+            acc = pathParts[0]; // ပထမဆုံးအကွက်က Account နံပါတ်
+            // ကျန်တာအကုန်ပြန်ပေါင်းမယ် (Filename/Folder)
+            video = decodeURIComponent(pathParts.slice(1).join('/'));
+        }
+    }
+
+    // Ping check
     if (video === "ping") return res.status(200).send("Pong!");
 
-    if (!video || !R2_ACCOUNTS[acc]) {
-      return res.status(400).send("Invalid Parameters");
+    // Validation
+    if (!video || !acc || !R2_ACCOUNTS[acc]) {
+      return res.status(400).send("Invalid Parameters. Use format: /api/1/folder/video.m3u8");
     }
 
     const creds = R2_ACCOUNTS[acc];
@@ -31,13 +48,12 @@ export default async function handler(req, res) {
     });
 
     const endpoint = `https://${creds.accountId}.r2.cloudflarestorage.com`;
-    const objectPath = decodeURIComponent(video);
     
     // =========================================================
-    // 🎥 PART 1: M3U8 HANDLING (Dynamic Rewriter)
+    // 🎥 PART 1: M3U8 HANDLING (VPN Bypass & Rewrite)
     // =========================================================
-    if (objectPath.endsWith(".m3u8")) {
-        const encodedPath = objectPath.split('/').map(encodeURIComponent).join('/');
+    if (video.endsWith(".m3u8")) {
+        const encodedPath = video.split('/').map(encodeURIComponent).join('/');
         const m3u8Url = new URL(`${endpoint}/${creds.bucketName}/${encodedPath}`);
         
         // Master File ကို Sign လုပ်ခြင်း
@@ -48,22 +64,19 @@ export default async function handler(req, res) {
             expiresIn: 3600
         });
 
-        // R2 ဆီက M3U8 စာသားကို လှမ်းယူခြင်း
         const response = await fetch(signedM3u8.url);
         if (!response.ok) return res.status(404).send("M3U8 Not Found");
         
         const originalText = await response.text();
         
         // Base Directory ရှာခြင်း
-        const lastSlashIndex = objectPath.lastIndexOf("/");
-        const baseDir = lastSlashIndex !== -1 ? objectPath.substring(0, lastSlashIndex + 1) : "";
+        const lastSlashIndex = video.lastIndexOf("/");
+        const baseDir = lastSlashIndex !== -1 ? video.substring(0, lastSlashIndex + 1) : "";
 
-        // လိုင်းတစ်ကြောင်းစီကို လိုက်စစ်ပြီး .ts တွေ့ရင် Sign လုပ်ခြင်း
+        // Rewrite Lines (.ts files to Signed URLs)
         const lines = originalText.split("\n");
         const newLines = await Promise.all(lines.map(async (line) => {
             const trimmed = line.trim();
-            
-            // .ts သို့မဟုတ် .mp4 နဲ့ဆုံးတဲ့လိုင်းဆိုရင်
             if (trimmed && !trimmed.startsWith("#") && (trimmed.endsWith(".ts") || trimmed.endsWith(".m4s") || trimmed.endsWith(".mp4"))) {
                 let fullPath = trimmed;
                 if (!trimmed.startsWith("http")) {
@@ -73,36 +86,32 @@ export default async function handler(req, res) {
                 const encodedFullPath = fullPath.split('/').map(encodeURIComponent).join('/');
                 const tsUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedFullPath}`);
                 
-                // Segment တစ်ခုချင်းစီကို 4 နာရီသက်တမ်းနဲ့ Sign လုပ်ခြင်း
                 const signedTs = await r2.sign(tsUrl, {
                     method: "GET",
                     aws: { signQuery: true },
                     headers: { "Host": `${creds.accountId}.r2.cloudflarestorage.com` },
-                    expiresIn: 14400 
+                    expiresIn: 14400 // 4 Hours
                 });
-                
                 return signedTs.url;
             }
             return line;
         }));
 
-        // ပြင်ပြီးသား M3U8 ကို ပြန်ပို့ခြင်း
-        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl'); // APK အတွက် အရေးကြီး
         res.setHeader('Access-Control-Allow-Origin', '*');
         return res.status(200).send(newLines.join("\n"));
     }
 
     // =========================================================
-    // 📦 PART 2: MP4 HANDLING (File Size Fix & Redirect)
+    // 📦 PART 2: MP4 HANDLING (Size Fix)
     // =========================================================
-    const cleanFileName = objectPath.split('/').pop();
+    const cleanFileName = video.split('/').pop();
     const encodedFileName = encodeURIComponent(cleanFileName);
     const contentDisposition = `attachment; filename="${cleanFileName}"; filename*=UTF-8''${encodedFileName}`;
     
-    const encodedPath = objectPath.split('/').map(encodeURIComponent).join('/');
+    const encodedPath = video.split('/').map(encodeURIComponent).join('/');
     const objectUrl = new URL(`${endpoint}/${creds.bucketName}/${encodedPath}`);
     
-    // Force Download Name
     objectUrl.searchParams.set("response-content-disposition", contentDisposition);
     
     const signed = await r2.sign(objectUrl, {
@@ -112,11 +121,9 @@ export default async function handler(req, res) {
       expiresIn: 14400
     });
 
-    // 🔥 HEAD Request (APK Size Check)
     if (req.method === "HEAD") {
       const r2Response = await fetch(signed.url, { method: "HEAD" });
       
-      // Header များကို APK မြင်အောင် ဖွင့်ပေးခြင်း
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
       res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Type, Content-Disposition, Accept-Ranges, ETag");
@@ -131,7 +138,6 @@ export default async function handler(req, res) {
       return res.status(200).end();
     }
 
-    // ⬇️ GET Request (Redirect)
     return res.redirect(302, signed.url);
 
   } catch (error) {
